@@ -1,0 +1,13 @@
+{
+  "name": "cpp-live-text-to-speech",
+  "version-string": "1.0.0",
+  "dependencies": [
+    "crow",
+    "boost-beast",
+    "boost-asio",
+    "boost-system",
+    "openssl",
+    "toml11",
+    "jwt-cpp"
+  ]
+}

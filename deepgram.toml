@@ -1,0 +1,51 @@
+[meta]
+title = "C++ Live Text-to-Speech Starter"
+description = "Get started using Deepgram's Live Text-to-Speech with this C++ demo app"
+author = "Deepgram DX Team <devrel@deepgram.com> (https://developers.deepgram.com)"
+repository = "https://github.com/deepgram-starters/cpp-live-text-to-speech"
+useCase = "live-text-to-speech"
+language = "cpp"
+framework = "Crow"
+sdk = "N/A"
+tags = ["live-text-to-speech", "live-tts", "streaming-tts", "real-time-tts", "streaming-text-to-speech", "cpp", "crow"]
+
+[check]
+command = ["command -v git", "command -v cmake", "command -v pnpm"]
+message = "Prerequisites checked"
+
+[install.pre]
+command = "git submodule update --init --recursive"
+message = "Submodules initialized"
+
+[install]
+command = ["cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake && cmake --build build", "cd frontend && corepack pnpm install"]
+message = "Dependencies installed"
+
+[install.config]
+sample = "sample.env"
+output = ".env"
+
+[start.pre]
+command = ["test -f .env || echo 'Error: .env file not found'", "test -d frontend/.git || echo 'Error: Frontend submodule not initialized'"]
+message = "Pre-flight checks complete"
+
+[start]
+command = ["./build/cpp-live-text-to-speech", "cd frontend && pnpm run dev -- --port 8080 --no-open"]
+parallel = true
+message = "Application running on http://localhost:8080"
+
+[update]
+command = "git submodule update --remote --merge"
+message = "Submodules updated"
+
+[clean]
+command = ["rm -rf build", "rm -rf frontend/node_modules", "rm -rf frontend/dist", "rm -rf vcpkg_installed"]
+message = "Build artifacts cleaned"
+
+[eject-frontend]
+command = "make eject-frontend"
+message = "Frontend ejected successfully"
+
+[test]
+command = "bash contracts/tests/run-live-text-to-speech-app.sh"
+message = "Running conformance tests"

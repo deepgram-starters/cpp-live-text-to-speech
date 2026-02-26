@@ -1,0 +1,24 @@
+# Build output
+build/
+
+# Environment
+.env
+
+# vcpkg installed packages
+vcpkg_installed/
+
+# Frontend build output
+frontend/dist/
+
+# Dependencies (frontend)
+node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
