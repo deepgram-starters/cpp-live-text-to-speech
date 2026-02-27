@@ -23,6 +23,7 @@
 #include <boost/beast/websocket/ssl.hpp>
 
 #include <jwt-cpp/jwt.h>
+#include <jwt-cpp/traits/kazuho-picojson/defaults.h>
 #include <toml.hpp>
 
 #include <chrono>
@@ -147,7 +148,6 @@ static bool validate_token(const std::string& token, const std::string& secret) 
         auto decoded = jwt::decode(token);
         auto verifier = jwt::verify()
             .allow_algorithm(jwt::algorithm::hs256{secret})
-            .with_issuer("")
             .leeway(5);
         verifier.verify(decoded);
         return true;
@@ -354,7 +354,9 @@ public:
         if (closed_ || !connected_) return;
         closed_ = true;
         try {
-            ws_->close(websocket::close_code::normal);
+            // Cancel the underlying socket to interrupt the read_loop
+            // instead of calling ws_->close() which asserts if read is active
+            beast::get_lowest_layer(*ws_).cancel();
         } catch (...) {
             // Connection may already be closed
         }
@@ -560,10 +562,8 @@ int main() {
     // WS /api/live-text-to-speech - WebSocket proxy to Deepgram TTS
     // -----------------------------------------------------------------
     CROW_WEBSOCKET_ROUTE(app, "/api/live-text-to-speech")
-        .onopen([&cfg](crow::websocket::connection& conn) {
-            // Validate JWT from subprotocol
-            // Crow exposes the upgrade request; extract Sec-WebSocket-Protocol
-            auto& req = conn.get_request();
+        .mirrorprotocols()
+        .onaccept([&cfg](const crow::request& req, void** userdata) -> bool {
             std::string protocols =
                 std::string(req.get_header_value("Sec-WebSocket-Protocol"));
             std::string valid_proto =
@@ -572,15 +572,26 @@ int main() {
             if (valid_proto.empty()) {
                 CROW_LOG_WARNING
                     << "WebSocket auth failed: invalid or missing token";
-                conn.close("Unauthorized");
-                return;
+                return false;
             }
 
+            // Store query string for onopen
+            auto qpos = req.raw_url.find('?');
+            std::string qs = (qpos != std::string::npos) ? req.raw_url.substr(qpos) : "";
+            *userdata = new std::string(qs);
+            return true;
+        })
+        .onopen([&cfg](crow::websocket::connection& conn) {
             CROW_LOG_INFO << "Client connected to /api/live-text-to-speech";
             track_connection(&conn);
 
+            // Retrieve stored query string
+            auto* qs_ptr = static_cast<std::string*>(conn.userdata());
+            std::string url = "/api/live-text-to-speech" + (qs_ptr ? *qs_ptr : "");
+            delete qs_ptr;
+            conn.userdata(nullptr);
+
             // Parse query parameters from the upgrade URL
-            std::string url = std::string(req.url);
             std::string model       = query_param(url, "model", "aura-asteria-en");
             std::string encoding    = query_param(url, "encoding", "linear16");
             std::string sample_rate = query_param(url, "sample_rate", "24000");
@@ -651,7 +662,7 @@ int main() {
             }
         })
         .onclose([](crow::websocket::connection& conn,
-                     const std::string& reason) {
+                     const std::string& reason, uint16_t) {
             CROW_LOG_INFO << "Client disconnected: " << reason;
             untrack_connection(&conn);
 

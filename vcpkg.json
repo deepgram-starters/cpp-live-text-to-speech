@@ -8,6 +8,7 @@
     "boost-system",
     "openssl",
     "toml11",
-    "jwt-cpp"
+    "jwt-cpp",
+    "picojson"
   ]
 }
