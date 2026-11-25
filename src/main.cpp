@@ -354,10 +354,10 @@ public:
      * Send a message to Deepgram. binary=true for binary frames.
      */
     void send(const std::string& data, bool binary) {
-        if (!connected_ || close_requested_.load()) return;
+        if (!connected_) return;
         auto self = shared_from_this();
         net::post(ws_->get_executor(), [self, data, binary]() {
-            if (self->close_requested_.load() || self->finished_) return;
+            if (self->close_requested_ || self->finished_) return;
             self->write_queue_.push_back({data, binary});
             self->do_write();
         });
@@ -367,10 +367,11 @@ public:
      * Close the Deepgram connection.
      */
     void close() {
-        if (!connected_ || close_requested_.exchange(true)) return;
+        if (!connected_) return;
         auto self = shared_from_this();
         net::post(ws_->get_executor(), [self]() {
-            if (self->finished_) return;
+            if (self->close_requested_ || self->finished_) return;
+            self->close_requested_ = true;
             if (self->write_queue_.empty() && !self->write_in_progress_) {
                 self->begin_close();
             } else {
@@ -379,16 +380,8 @@ public:
         });
     }
 
-    void close_and_wait() {
-        close();
-        if (io_thread_.joinable() &&
-            io_thread_.get_id() != std::this_thread::get_id()) {
-            io_thread_.join();
-        }
-    }
-
     bool is_connected() const {
-        return connected_ && !close_requested_.load();
+        return connected_ && !finished_;
     }
 
 private:
@@ -398,7 +391,7 @@ private:
     };
 
     void do_read() {
-        if (finished_ || close_requested_.load()) return;
+        if (finished_ || close_requested_) return;
 
         ws_->async_read(read_buffer_,
                         [self = shared_from_this()](beast::error_code ec,
@@ -447,7 +440,7 @@ private:
             }
 
             self->write_queue_.pop_front();
-            if (self->close_requested_.load() &&
+            if (self->close_requested_ &&
                 self->write_queue_.empty()) {
                 self->begin_close();
             } else {
@@ -493,7 +486,7 @@ private:
     beast::flat_buffer read_buffer_;
     std::deque<PendingWrite> write_queue_;
     std::atomic<bool> connected_;
-    std::atomic<bool> close_requested_;
+    bool close_requested_;
     bool write_in_progress_;
     std::atomic<bool> finished_;
 };
@@ -800,7 +793,7 @@ int main() {
             }
 
             if (dg_client) {
-                dg_client->close_and_wait();
+                dg_client->close();
             }
 
             CROW_LOG_INFO << "WebSocket proxy session ended";
