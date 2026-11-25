@@ -17,6 +17,7 @@
 
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/beast.hpp>
 #include <boost/beast/ssl.hpp>
 #include <boost/beast/websocket.hpp>
@@ -257,6 +258,7 @@ public:
         , ioc_()
         , ssl_ctx_(ssl::context::tlsv12_client)
         , resolver_(net::make_strand(ioc_))
+        , shutdown_timer_(ioc_)
         , connected_(false)
         , close_requested_(false)
         , write_in_progress_(false)
@@ -358,7 +360,16 @@ public:
         auto self = shared_from_this();
         net::post(ws_->get_executor(), [self, data, binary]() {
             if (self->close_requested_ || self->finished_) return;
+            if (self->write_queue_.size() >= MAX_PENDING_MESSAGES ||
+                data.size() > MAX_PENDING_BYTES - self->pending_write_bytes_) {
+                std::cerr << "Deepgram write queue overflow\n";
+                self->close_requested_ = true;
+                self->start_shutdown_deadline();
+                self->begin_close();
+                return;
+            }
             self->write_queue_.push_back({data, binary});
+            self->pending_write_bytes_ += data.size();
             self->do_write();
         });
     }
@@ -372,6 +383,7 @@ public:
         net::post(ws_->get_executor(), [self]() {
             if (self->close_requested_ || self->finished_) return;
             self->close_requested_ = true;
+            self->start_shutdown_deadline();
             if (self->write_queue_.empty() && !self->write_in_progress_) {
                 self->begin_close();
             } else {
@@ -385,10 +397,27 @@ public:
     }
 
 private:
+    static constexpr std::size_t MAX_PENDING_MESSAGES = 128;
+    static constexpr std::size_t MAX_PENDING_BYTES = 1024 * 1024;
+    static constexpr std::chrono::seconds SHUTDOWN_TIMEOUT{5};
+
     struct PendingWrite {
         std::string data;
         bool binary;
     };
+
+    void start_shutdown_deadline() {
+        shutdown_timer_.expires_after(SHUTDOWN_TIMEOUT);
+        shutdown_timer_.async_wait([self = shared_from_this()](
+                                       beast::error_code ec) {
+            if (ec == net::error::operation_aborted || self->finished_) {
+                return;
+            }
+            std::cerr << "Deepgram shutdown timed out\n";
+            beast::get_lowest_layer(*self->ws_).cancel();
+            self->finish();
+        });
+    }
 
     void do_read() {
         if (finished_ || close_requested_) return;
@@ -439,6 +468,8 @@ private:
                 return;
             }
 
+            self->pending_write_bytes_ -=
+                self->write_queue_.front().data.size();
             self->write_queue_.pop_front();
             if (self->close_requested_ &&
                 self->write_queue_.empty()) {
@@ -466,6 +497,8 @@ private:
         if (finished_.exchange(true)) return;
         connected_ = false;
         write_queue_.clear();
+        pending_write_bytes_ = 0;
+        shutdown_timer_.cancel();
         if (on_close_) {
             on_close_();
         }
@@ -481,10 +514,12 @@ private:
     net::io_context ioc_;
     ssl::context    ssl_ctx_;
     tcp::resolver   resolver_;
+    net::steady_timer shutdown_timer_;
     std::unique_ptr<websocket::stream<beast::ssl_stream<beast::tcp_stream>>> ws_;
     std::thread     io_thread_;
     beast::flat_buffer read_buffer_;
     std::deque<PendingWrite> write_queue_;
+    std::size_t pending_write_bytes_ = 0;
     std::atomic<bool> connected_;
     bool close_requested_;
     bool write_in_progress_;
@@ -716,15 +751,9 @@ int main() {
                 // on_close: notify client that Deepgram disconnected
                 [&conn, client_state]() {
                     CROW_LOG_INFO << "Deepgram connection closed";
-                    bool close_browser = false;
-                    {
-                        std::lock_guard<std::mutex> lock(client_state->mutex);
-                        if (client_state->active) {
-                            client_state->active = false;
-                            close_browser = true;
-                        }
-                    }
-                    if (!close_browser) return;
+                    std::lock_guard<std::mutex> lock(client_state->mutex);
+                    if (!client_state->active) return;
+                    client_state->active = false;
                     try {
                         conn.close("Deepgram disconnected");
                     } catch (...) {}
