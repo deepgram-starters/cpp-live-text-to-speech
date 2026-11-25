@@ -237,10 +237,11 @@ static std::string read_metadata() {
  *
  * Lifecycle:
  *   1. Construct with URL, API key, and callbacks
- *   2. Call connect() -- blocks until connected or fails
- *   3. Call send() to forward client messages to Deepgram
- *   4. Receive callbacks when Deepgram sends data back
- *   5. Call close() or let destructor clean up
+ *   2. Call connect() -- blocks until the upstream handshake succeeds
+ *   3. Register the browser connection lifetime state, then call start()
+ *   4. Call send() to forward client messages to Deepgram
+ *   5. Receive callbacks when Deepgram sends data back
+ *   6. Call close() or let destructor clean up
  */
 class DeepgramWSClient : public std::enable_shared_from_this<DeepgramWSClient> {
 public:
@@ -335,21 +336,29 @@ public:
             ws_->handshake(host_header, target_);
             connected_ = true;
 
-            // Run every Beast operation on one executor. In particular, this
-            // keeps asynchronous reads, queued writes, and close on the same
-            // strand instead of racing a blocking read against socket cancel.
-            net::post(ws_->get_executor(), [self = shared_from_this()]() {
-                self->do_read();
-            });
-            io_thread_ = std::thread([self = shared_from_this()]() {
-                self->ioc_.run();
-            });
-
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Deepgram connection failed: " << e.what() << "\n";
             return false;
         }
+    }
+
+    /**
+     * Begin asynchronous I/O only after the caller has registered callbacks'
+     * browser connection lifetime state.
+     */
+    void start() {
+        if (!connected_ || io_thread_.joinable()) return;
+
+        // Run every Beast operation on one executor. In particular, this
+        // keeps asynchronous reads, queued writes, and close on the same
+        // strand instead of racing a blocking read against socket cancel.
+        net::post(ws_->get_executor(), [self = shared_from_this()]() {
+            self->do_read();
+        });
+        io_thread_ = std::thread([self = shared_from_this()]() {
+            self->ioc_.run();
+        });
     }
 
     /**
@@ -464,6 +473,7 @@ private:
                     std::cerr << "Deepgram write error: " << ec.message()
                               << "\n";
                 }
+                beast::get_lowest_layer(*self->ws_).cancel();
                 self->finish();
                 return;
             }
@@ -775,6 +785,7 @@ int main() {
             }
             conn.userdata(new std::shared_ptr<BrowserConnectionState>(
                 std::move(client_state)));
+            dg_client->start();
         })
         .onmessage([](crow::websocket::connection& conn,
                        const std::string& data, bool is_binary) {
