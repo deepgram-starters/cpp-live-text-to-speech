@@ -27,7 +27,9 @@
 #include <toml.hpp>
 
 #include <chrono>
+#include <atomic>
 #include <cstdlib>
+#include <deque>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -256,7 +258,9 @@ public:
         , ssl_ctx_(ssl::context::tlsv12_client)
         , resolver_(net::make_strand(ioc_))
         , connected_(false)
-        , closed_(false)
+        , close_requested_(false)
+        , write_in_progress_(false)
+        , finished_(false)
     {
         ssl_ctx_.set_default_verify_paths();
         ssl_ctx_.set_verify_mode(ssl::verify_none);
@@ -265,7 +269,13 @@ public:
     ~DeepgramWSClient() {
         close();
         if (io_thread_.joinable()) {
-            io_thread_.join();
+            // The io thread holds a shared_ptr to this instance. When that is
+            // the final owner, destruction happens on the io thread itself.
+            if (io_thread_.get_id() == std::this_thread::get_id()) {
+                io_thread_.detach();
+            } else {
+                io_thread_.join();
+            }
         }
     }
 
@@ -320,9 +330,14 @@ public:
             ws_->handshake(host_header, target_);
             connected_ = true;
 
-            // Start reading in background thread
+            // Run every Beast operation on one executor. In particular, this
+            // keeps asynchronous reads, queued writes, and close on the same
+            // strand instead of racing a blocking read against socket cancel.
+            net::post(ws_->get_executor(), [self = shared_from_this()]() {
+                self->do_read();
+            });
             io_thread_ = std::thread([self = shared_from_this()]() {
-                self->read_loop();
+                self->ioc_.run();
             });
 
             return true;
@@ -336,59 +351,112 @@ public:
      * Send a message to Deepgram. binary=true for binary frames.
      */
     void send(const std::string& data, bool binary) {
-        std::lock_guard<std::mutex> lock(write_mutex_);
-        if (!connected_ || closed_) return;
-        try {
-            ws_->binary(binary);
-            ws_->write(net::buffer(data));
-        } catch (const std::exception& e) {
-            std::cerr << "Error sending to Deepgram: " << e.what() << "\n";
-        }
+        if (!connected_ || close_requested_) return;
+        auto self = shared_from_this();
+        net::post(ws_->get_executor(), [self, data, binary]() {
+            if (self->close_requested_ || self->finished_) return;
+            self->write_queue_.push_back({data, binary});
+            self->do_write();
+        });
     }
 
     /**
      * Close the Deepgram connection.
      */
     void close() {
-        std::lock_guard<std::mutex> lock(write_mutex_);
-        if (closed_ || !connected_) return;
-        closed_ = true;
-        try {
-            // Cancel the underlying socket to interrupt the read_loop
-            // instead of calling ws_->close() which asserts if read is active
-            beast::get_lowest_layer(*ws_).cancel();
-        } catch (...) {
-            // Connection may already be closed
-        }
+        if (!connected_ || close_requested_) return;
+        auto self = shared_from_this();
+        net::post(ws_->get_executor(), [self]() {
+            if (self->close_requested_ || self->finished_) return;
+            self->close_requested_ = true;
+            self->begin_close();
+        });
     }
 
-    bool is_connected() const { return connected_ && !closed_; }
+    bool is_connected() const { return connected_ && !close_requested_; }
 
 private:
-    void read_loop() {
-        try {
-            while (connected_ && !closed_) {
-                beast::flat_buffer buffer;
-                ws_->read(buffer);
+    struct PendingWrite {
+        std::string data;
+        bool binary;
+    };
 
-                bool is_binary = ws_->got_binary();
-                std::string data(
-                    static_cast<const char*>(buffer.data().data()),
-                    buffer.data().size());
+    void do_read() {
+        if (finished_ || close_requested_) return;
 
-                if (on_message_) {
-                    on_message_(data, is_binary);
+        ws_->async_read(read_buffer_,
+                        [self = shared_from_this()](beast::error_code ec,
+                                                    std::size_t) {
+            if (ec) {
+                if (ec != websocket::error::closed &&
+                    ec != net::error::operation_aborted) {
+                    std::cerr << "Deepgram read error: " << ec.message()
+                              << "\n";
                 }
+                self->finish();
+                return;
             }
-        } catch (const beast::system_error& se) {
-            if (se.code() != websocket::error::closed) {
-                std::cerr << "Deepgram read error: " << se.what() << "\n";
+
+            const bool is_binary = self->ws_->got_binary();
+            std::string data(
+                static_cast<const char*>(self->read_buffer_.data().data()),
+                self->read_buffer_.size());
+            self->read_buffer_.consume(self->read_buffer_.size());
+
+            if (self->on_message_) {
+                self->on_message_(data, is_binary);
             }
-        } catch (const std::exception& e) {
-            std::cerr << "Deepgram read error: " << e.what() << "\n";
+            self->do_read();
+        });
+    }
+
+    void do_write() {
+        if (write_in_progress_ || write_queue_.empty() ||
+            close_requested_ || finished_) {
+            return;
         }
 
+        write_in_progress_ = true;
+        ws_->binary(write_queue_.front().binary);
+        ws_->async_write(net::buffer(write_queue_.front().data),
+                         [self = shared_from_this()](beast::error_code ec,
+                                                     std::size_t) {
+            self->write_in_progress_ = false;
+            if (ec) {
+                if (ec != net::error::operation_aborted) {
+                    std::cerr << "Deepgram write error: " << ec.message()
+                              << "\n";
+                }
+                self->finish();
+                return;
+            }
+
+            self->write_queue_.pop_front();
+            if (self->close_requested_) {
+                self->begin_close();
+            } else {
+                self->do_write();
+            }
+        });
+    }
+
+    void begin_close() {
+        if (finished_ || write_in_progress_) return;
+
+        ws_->async_close(websocket::close_code::normal,
+                         [self = shared_from_this()](beast::error_code ec) {
+            if (ec && ec != websocket::error::closed &&
+                ec != net::error::operation_aborted) {
+                std::cerr << "Deepgram close error: " << ec.message() << "\n";
+            }
+            self->finish();
+        });
+    }
+
+    void finish() {
+        if (finished_.exchange(true)) return;
         connected_ = false;
+        write_queue_.clear();
         if (on_close_) {
             on_close_();
         }
@@ -406,9 +474,12 @@ private:
     tcp::resolver   resolver_;
     std::unique_ptr<websocket::stream<beast::ssl_stream<beast::tcp_stream>>> ws_;
     std::thread     io_thread_;
-    std::mutex      write_mutex_;
+    beast::flat_buffer read_buffer_;
+    std::deque<PendingWrite> write_queue_;
     std::atomic<bool> connected_;
-    std::atomic<bool> closed_;
+    bool close_requested_;
+    bool write_in_progress_;
+    std::atomic<bool> finished_;
 };
 
 // ============================================================================
