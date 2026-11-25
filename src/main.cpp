@@ -463,10 +463,14 @@ private:
         }
 
         write_in_progress_ = true;
-        ws_->binary(write_queue_.front().binary);
-        ws_->async_write(net::buffer(write_queue_.front().data),
-                         [self = shared_from_this()](beast::error_code ec,
-                                                     std::size_t) {
+        auto payload = std::make_shared<PendingWrite>(
+            std::move(write_queue_.front()));
+        pending_write_bytes_ -= payload->data.size();
+        write_queue_.pop_front();
+        ws_->binary(payload->binary);
+        ws_->async_write(net::buffer(payload->data),
+                         [self = shared_from_this(), payload](
+                             beast::error_code ec, std::size_t) {
             self->write_in_progress_ = false;
             if (ec) {
                 if (ec != net::error::operation_aborted) {
@@ -478,9 +482,6 @@ private:
                 return;
             }
 
-            self->pending_write_bytes_ -=
-                self->write_queue_.front().data.size();
-            self->write_queue_.pop_front();
             if (self->close_requested_ &&
                 self->write_queue_.empty()) {
                 self->begin_close();
